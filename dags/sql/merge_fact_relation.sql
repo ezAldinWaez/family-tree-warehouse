@@ -1,5 +1,5 @@
 WITH current_run AS (
-  SELECT run_id FROM _etl_context LIMIT 1
+  SELECT '{{ ti.xcom_pull(task_ids="extract_raw_data") }}' AS run_id
 ), latest_rel AS (
   SELECT
     r.person_id,
@@ -69,7 +69,7 @@ LEFT JOIN fact_person_family_relation fct
 WHERE fct.relation_sk IS NULL;
 
 WITH current_run AS (
-  SELECT run_id FROM _etl_context LIMIT 1
+  SELECT '{{ ti.xcom_pull(task_ids="extract_raw_data") }}' AS run_id
 ), latest_rel AS (
   SELECT
     person_id,
@@ -99,7 +99,7 @@ WHERE fct.source_person_id = lr.person_id
   AND ro.role_code = lr.role;
 
 WITH current_run AS (
-  SELECT run_id FROM _etl_context LIMIT 1
+  SELECT '{{ ti.xcom_pull(task_ids="extract_raw_data") }}' AS run_id
 ), latest_rel AS (
   SELECT
     person_id,

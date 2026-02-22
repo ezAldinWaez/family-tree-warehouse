@@ -18,7 +18,7 @@ SELECT
     coalesce(p.works, '')
   ) AS attr_hash
 FROM raw_person_snapshot p
-WHERE p.run_id = (SELECT run_id FROM _etl_context LIMIT 1);
+WHERE p.run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}';
 
 CREATE TEMP TABLE tmp_person_changed AS
 SELECT d.person_sk
@@ -30,7 +30,7 @@ WHERE d.is_current = TRUE
 
 UPDATE dim_person
 SET is_current = FALSE,
-    valid_to_run_id = (SELECT run_id FROM _etl_context LIMIT 1)
+  valid_to_run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}'
 WHERE person_sk IN (SELECT person_sk FROM tmp_person_changed);
 
 INSERT INTO dim_person (
@@ -57,7 +57,7 @@ SELECT
   s.education,
   s.works,
   s.attr_hash,
-  (SELECT run_id FROM _etl_context LIMIT 1),
+  '{{ ti.xcom_pull(task_ids="extract_raw_data") }}',
   TRUE,
   FALSE
 FROM tmp_person_latest s
@@ -70,12 +70,12 @@ WHERE d.person_id IS NULL
 UPDATE dim_person d
 SET is_current = FALSE,
     is_deleted = TRUE,
-    valid_to_run_id = (SELECT run_id FROM _etl_context LIMIT 1)
+    valid_to_run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}'
 WHERE d.is_current = TRUE
   AND NOT EXISTS (
     SELECT 1
     FROM raw_person_snapshot p
-    WHERE p.run_id = (SELECT run_id FROM _etl_context LIMIT 1)
+    WHERE p.run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}'
       AND p.person_id = d.person_id
   );
 

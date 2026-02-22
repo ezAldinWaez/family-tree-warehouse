@@ -10,7 +10,7 @@ SELECT
     coalesce(f.status, '')
   ) AS attr_hash
 FROM raw_family_snapshot f
-WHERE f.run_id = (SELECT run_id FROM _etl_context LIMIT 1);
+WHERE f.run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}';
 
 CREATE TEMP TABLE tmp_family_changed AS
 SELECT d.family_sk
@@ -22,7 +22,7 @@ WHERE d.is_current = TRUE
 
 UPDATE dim_family
 SET is_current = FALSE,
-    valid_to_run_id = (SELECT run_id FROM _etl_context LIMIT 1)
+  valid_to_run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}'
 WHERE family_sk IN (SELECT family_sk FROM tmp_family_changed);
 
 INSERT INTO dim_family (
@@ -41,7 +41,7 @@ SELECT
   s.divorce_date,
   s.status,
   s.attr_hash,
-  (SELECT run_id FROM _etl_context LIMIT 1),
+  '{{ ti.xcom_pull(task_ids="extract_raw_data") }}',
   TRUE,
   FALSE
 FROM tmp_family_latest s
@@ -54,12 +54,12 @@ WHERE d.family_id IS NULL
 UPDATE dim_family d
 SET is_current = FALSE,
     is_deleted = TRUE,
-    valid_to_run_id = (SELECT run_id FROM _etl_context LIMIT 1)
+    valid_to_run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}'
 WHERE d.is_current = TRUE
   AND NOT EXISTS (
     SELECT 1
     FROM raw_family_snapshot f
-    WHERE f.run_id = (SELECT run_id FROM _etl_context LIMIT 1)
+    WHERE f.run_id = '{{ ti.xcom_pull(task_ids="extract_raw_data") }}'
       AND f.family_id = d.family_id
   );
 

@@ -1,196 +1,165 @@
 # Family Tree Warehouse
 
-Incremental Neo4j → DuckDB ETL with an exact star schema for family graph analytics.
+Airflow-based incremental ETL pipeline: Neo4j -> DuckDB star schema for family graph analytics.
 
-## What this project does
+## What this does
 
-- Extracts `Person`, `Family`, and relationship data (`SPOUSE_OF`, `CHILD_OF`) from Neo4j.
-- Stores each extraction as an append-only raw snapshot in DuckDB (`run_id` based).
-- Builds star-schema warehouse tables with:
-  - SCD2 dimensions for `person` and `family`.
-  - Static dimensions for relationship type and role.
-  - A unified relationship fact table.
-- Runs data-quality checks after each load.
+Extracts family tree data from Neo4j and builds a dimensional warehouse in DuckDB with:
+- **SCD2 dimensions** for `person` and `family` tracking historical changes
+- **Static dimensions** for relationship types and roles  
+- **Fact table** capturing person-family relationships
+- **Incremental snapshot-diff** strategy (no CDC required)
 
-## Architecture flow
+## Architecture
+
+**Pipeline:** Neo4j (graph source) -> Python extraction -> DuckDB raw snapshots -> SQL transforms -> Star schema
 
 ```mermaid
-flowchart LR
 flowchart TD
-  A["Neo4j Graph<br>Person, Family, SPOUSE_OF, CHILD_OF"] --> B["Python Extract Layer\nextract.py"]
-  B --> C["DuckDB Raw Snapshots<br>raw_person_snapshot<br>raw_family_snapshot<br>raw_relation_snapshot"]
-  C --> D["SCD2 Dimension Merges<br>merge_dim_person_scd2.sql<br>merge_dim_family_scd2.sql"]
-  C --> E["Fact Merge<br>merge_fact_relation.sql"]
-  D --> F["Star Schema in DuckDB<br>dim_person<br>dim_family<br>dim_relationship_type<br>dim_role<br>fact_person_family_relation"]
-  E --> F
-  F --> G["Data Quality Checks<br>run_dq_checks"]
+  A["Neo4j Graph<br>Person, Family, SPOUSE_OF, CHILD_OF"] 
+  B["Airflow: extract_raw_data<br>(PythonOperator)"]
+  C["DuckDB Raw Snapshots<br>raw_person_snapshot<br>raw_family_snapshot<br>raw_relation_snapshot"]
+    D["SCD2 Dimension Merges<br>(PythonOperator + DuckDB)"]
+    E["Fact Merge<br>(PythonOperator + DuckDB)"]
+  F["Star Schema<br>dim_person, dim_family<br>dim_relationship_type, dim_role<br>fact_person_family_relation"]
+    G["Run Status Update"]
+  A --> B --> C --> D --> E --> F --> G
 ```
 
-## Star schema design
+## Star schema
 
-### Dimensions
+**Dimensions:**
+- `dim_person` (SCD2): tracks person attributes with versioning (`is_current`, `valid_from_run_id`, `valid_to_run_id`, `is_deleted`)
+- `dim_family` (SCD2): tracks family attributes with versioning
+- `dim_relationship_type`: static lookup (`SPOUSE_OF`, `CHILD_OF`)
+- `dim_role`: static lookup (`HUSBAND`, `WIFE`, `NONE`)
 
-- `dim_person` (SCD2): person attributes and versioning columns (`is_current`, `valid_from_run_id`, `valid_to_run_id`, `is_deleted`).
-- `dim_family` (SCD2): family attributes and versioning columns.
-- `dim_relationship_type`: `SPOUSE_OF`, `CHILD_OF`.
-- `dim_role`: `HUSBAND`, `WIFE`, `NONE`.
-
-### Fact
-
-- `fact_person_family_relation` at grain:
-  - one row per `(person_id, family_id, relationship_type, role)` key.
-- Tracks first/last seen run, soft deletes, and FK links to current dimension rows.
+**Fact:**
+- `fact_person_family_relation`: grain = one row per `(person_id, family_id, relationship_type, role)` key  
+- Tracks first/last seen run, soft deletes, FK links to current dimension rows
 
 ## Incremental strategy
 
-Neo4j source currently has no `updated_at` columns, so this project uses **snapshot-diff incrementals**:
+**Snapshot-diff approach** (no CDC fields required in Neo4j):
 
-1. Extract source state into raw snapshot tables for a generated `run_id`.
-2. Compute SCD2 changes in dimensions using attribute hashes.
-3. Upsert fact rows from current snapshot and mark missing keys as soft-deleted.
+1. Extract full source state into raw snapshot tables tagged with `run_id`
+2. Compare snapshots using attribute hashes to detect SCD2 changes
+3. Upsert dimension rows and expire outdated versions
+4. Merge fact table and soft-delete missing relationships
 
-This gives reliable incrementals without requiring CDC fields in source data.
+This ensures reliable incremental loads without requiring `updated_at` columns in the source.
 
 ## Repository structure
 
-- `src/family_tree_dw/`
-  - `extract.py`: Neo4j queries and row mapping.
-  - `etl.py`: orchestrates schema init, extract/load, merges, and DQ.
-  - `cli.py`: command-line interface.
-  - `config.py`: environment-driven settings.
-  - `db.py`: DuckDB helpers.
-- `sql/`
-  - `ddl_star.sql`
-  - `merge_dim_person_scd2.sql`
-  - `merge_dim_family_scd2.sql`
-  - `merge_fact_relation.sql`
-- `dags/family_tree_dw_dag.py`: Airflow DAG.
-- `docker-compose.yml`: local Neo4j + Airflow stack.
-- `docker/airflow/`: Airflow image and bootstrap script.
-- `scripts/run_demo_e2e.sh`: one-command local demo run.
-- `demo_family_tree/init_cruz_young_family_tree.cyp`: sample graph seed.
-
-## Prerequisites
-
-- Python `>= 3.10`
-- Docker + Docker Compose (for full local stack)
-- Neo4j reachable from your runtime environment
-
-## Configuration
-
-Copy and edit environment file:
-
-```bash
-cp configs/settings.example.env .env
+```
+family-tree-warehouse/
+├── dags/
+│   ├── family_tree_dw_dag.py
+│   └── py/
+│   │   └── extraction_utils.py
+│   └── sql/
+│       ├── init_schema.sql
+│       ├── merge_dim_person_scd2.sql
+│       ├── merge_dim_family_scd2.sql
+│       ├── merge_fact_relation.sql
+│       └── seed_reference_dimensions.sql
+├── seed/
+│   └── init_cruz_young_family_tree.cyp  # Sample Neo4j seed data
+├── .docker/
+│   └── airflow/
+│       ├── Dockerfile
+│       ├── entrypoint.sh
+│       └── requirements.txt
+├── .env.example                   # Environment template
+├── docker-compose.yml             # Local Neo4j + Airflow stack
+└── README.md
 ```
 
-Required values:
+## Airflow DAG structure
 
-- `NEO4J_URI`
-- `NEO4J_USER`
-- `NEO4J_PASSWORD`
-- `DUCKDB_PATH`
+**DAG:** `family_tree_dw_incremental` (daily schedule)
 
-## Local CLI usage (without Airflow)
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
+**Task graph:**
+```
+init_schema (Python)
+    ↓
+extract_raw_data (Python)
+    ↓
+seed_reference_dimensions (Python)
+    ↓
+merge_dim_person (Python) ──┐
+merge_dim_family (Python) ──┤
+    ↓                    │
+merge_fact_relation (Python)
 ```
 
-Initialize schema:
+**Operators used:**
+- `PythonOperator`: Neo4j extraction + raw load + SQL file execution against DuckDB
 
+## Quick start
+
+**Step 0: Create local environment file**
 ```bash
-PYTHONPATH=src python -m family_tree_dw.cli init --env-file .env
+cp .env.example .env
 ```
 
-Run full pipeline:
-
+**Optional (Linux): run Docker without `sudo`**
 ```bash
-PYTHONPATH=src python -m family_tree_dw.cli run-all --env-file .env
+sudo usermod -aG docker $USER
+newgrp docker
 ```
 
-Run step-by-step:
-
+**Step 1: Start the stack**
 ```bash
-PYTHONPATH=src python -m family_tree_dw.cli extract-load --env-file .env
-PYTHONPATH=src python -m family_tree_dw.cli merge --env-file .env --run-id <RUN_ID>
-PYTHONPATH=src python -m family_tree_dw.cli dq --env-file .env --run-id <RUN_ID>
+sudo docker compose up -d --build
 ```
 
-## Docker + Airflow quick start
+**Step 2: Wait for services** (~30-60 seconds for Airflow to initialize)
 
-### Option A: one command demo
-
+**Step 3: Seed demo Neo4j data**
 ```bash
-bash scripts/run_demo_e2e.sh
+# Reset graph (optional, for clean demo runs)
+sudo docker exec family_tree_neo4j cypher-shell -u neo4j -p password "MATCH (n) DETACH DELETE n"
+
+# Load sample family tree
+sudo docker exec -i family_tree_neo4j cypher-shell -u neo4j -p password < seed/init_cruz_young_family_tree.cyp
 ```
 
-This script:
-
-1. Builds/starts services.
-2. Waits for Neo4j readiness.
-3. Resets Neo4j demo graph (`MATCH (n) DETACH DELETE n`).
-4. Loads demo Cypher data.
-5. Waits for DAG registration.
-6. Unpauses and triggers `family_tree_dw_incremental`.
-
-### Option B: manual commands
-
-Start services:
-
+**Step 4: Trigger the DAG**
 ```bash
-docker compose up -d --build
+# Unpause and trigger the ETL pipeline
+sudo docker exec family_tree_airflow airflow dags unpause family_tree_dw_incremental
+sudo docker exec family_tree_airflow airflow dags trigger family_tree_dw_incremental
 ```
 
-Seed demo data:
+**Step 5: Monitor**
+- **Airflow UI:** http://localhost:8080 
+- **Neo4j Browser:** http://localhost:7474
 
+## Validation
+
+**Check DAG runs:**
 ```bash
-docker exec -i family_tree_neo4j cypher-shell -u neo4j -p neo4j_password < demo_family_tree/init_cruz_young_family_tree.cyp
+sudo docker exec family_tree_airflow airflow dags list-runs -d family_tree_dw_incremental
 ```
 
-Trigger DAG:
-
+**Query warehouse:**
 ```bash
-docker exec family_tree_airflow airflow dags unpause family_tree_dw_incremental
-docker exec family_tree_airflow airflow dags trigger family_tree_dw_incremental
+sudo docker exec family_tree_airflow python -c "
+import duckdb
+c = duckdb.connect('/opt/warehouse/family_tree.duckdb')
+tables = ['raw_person_snapshot', 'raw_family_snapshot', 'raw_relation_snapshot', 
+          'dim_person', 'dim_family', 'fact_person_family_relation']
+for t in tables:
+    print(f'{t}: {c.execute(f\"SELECT COUNT(*) FROM {t}\").fetchone()[0]} rows')
+"
 ```
 
-Airflow UI:
-
-- URL: `http://localhost:8080`
-- Username: `admin`
-- Password: `admin`
-
-## Validation queries
-
-Check latest DAG runs:
-
+**View logs:**
 ```bash
-docker exec family_tree_airflow airflow dags list-runs -d family_tree_dw_incremental
+# Airflow task logs
+sudo docker logs family_tree_airflow
+
+# All services
+sudo docker compose logs -f
 ```
-
-Check warehouse counts:
-
-```bash
-docker exec family_tree_airflow python -c "import duckdb; c=duckdb.connect('/opt/project/warehouse/family_tree.duckdb'); tables=['raw_person_snapshot','raw_family_snapshot','raw_relation_snapshot','dim_person','dim_family','dim_relationship_type','dim_role','fact_person_family_relation']; [print(t, c.execute('SELECT COUNT(*) FROM '+t).fetchone()[0]) for t in tables]"
-```
-
-## Data quality checks included
-
-- One current row per business key in SCD2 dimensions.
-- Allowed domain values for family status and relationship roles.
-- Non-null fact foreign keys.
-
-## Troubleshooting
-
-- `DagNotFound`: wait until Airflow parses DAGs (handled in demo script).
-- Neo4j seed duplicate key error: reseed on a clean graph or use demo script reset step.
-- Docker permission denied: run Docker commands with the required permissions for your host.
-- DuckDB temporal conversion errors: this project normalizes Neo4j temporal values to Python native dates in extraction.
-
-## Notes
-
-- This repository ignores generated local artifacts (`__pycache__`, `.duckdb`, `warehouse/`).
-- The demo script is designed for reproducible reruns during development.

@@ -5,9 +5,10 @@ Airflow-based incremental ETL pipeline: Neo4j -> DuckDB star schema for family g
 ## What this does
 
 Extracts family tree data from Neo4j and builds a dimensional warehouse in DuckDB with:
-- **SCD2 dimensions** for `person` and `family` tracking historical changes
-- **Static dimensions** for relationship types and roles  
-- **Fact table** capturing person-family relationships
+- **SCD2 dimension** for `person` tracking historical changes
+- **Semantic relationship-role dimension** (type + directed role + inverse/symmetry rules)
+- **Calendar date dimension** for reusable time analysis
+- **Factless fact table** capturing directed person-person relationships over time
 - **Incremental snapshot-diff** strategy (no CDC required)
 
 ## Architecture
@@ -19,9 +20,9 @@ flowchart TD
   A["Neo4j Graph<br>Person, Family, SPOUSE_OF, CHILD_OF"] 
   B["Airflow: extract_raw_data<br>(PythonOperator)"]
   C["DuckDB Raw Snapshots<br>raw_person_snapshot<br>raw_family_snapshot<br>raw_relation_snapshot"]
-    D["SCD2 Dimension Merges<br>(PythonOperator + DuckDB)"]
-    E["Fact Merge<br>(PythonOperator + DuckDB)"]
-  F["Star Schema<br>dim_person, dim_family<br>dim_relationship_type, dim_role<br>fact_person_family_relation"]
+    D["Dimension Loads<br>(SQLExecuteQueryOperator)"]
+    E["Fact Merge<br>(SQLExecuteQueryOperator)"]
+  F["Star Schema<br>dim_person, dim_relationship_role, dim_date<br>fact_person_relationship"]
     G["Run Status Update"]
   A --> B --> C --> D --> E --> F --> G
 ```
@@ -30,13 +31,17 @@ flowchart TD
 
 **Dimensions:**
 - `dim_person` (SCD2): tracks person attributes with versioning (`is_current`, `valid_from_run_id`, `valid_to_run_id`, `is_deleted`)
-- `dim_family` (SCD2): tracks family attributes with versioning
-- `dim_relationship_type`: static lookup (`SPOUSE_OF`, `CHILD_OF`)
-- `dim_role`: static lookup (`HUSBAND`, `WIFE`, `NONE`)
+- `dim_relationship_role`: unified semantic dimension for relationship type + directed role (`relationship_role_code`, inverse role mapping, symmetry)
+- `dim_date`: standard calendar dimension (`date_sk`, `full_date`, day/month/quarter/year attributes)
 
 **Fact:**
-- `fact_person_family_relation`: grain = one row per `(person_id, family_id, relationship_type, role)` key  
-- Tracks first/last seen run, soft deletes, FK links to current dimension rows
+- `fact_person_relationship`: grain = one row per directed relationship `(source_person_id, target_person_id, relationship_role_code, start_date, end_date, end_reason)`
+- Tracks relationship lifecycle (`start_date`, nullable `end_date`, nullable `end_reason`) plus first/last seen run and soft deletes
+
+**Derived relationships:**
+- Spouse edges are generated in both directions from family spouse memberships
+- Parent/child edges are generated in both directions
+- Sibling logic uses shared parents: `SIBLING` for 2+ shared parents, `HALF_SIBLING` for exactly 1 shared parent
 
 ## Incremental strategy
 
@@ -60,7 +65,7 @@ family-tree-warehouse/
 │   └── sql/
 │       ├── init_schema.sql
 │       ├── merge_dim_person_scd2.sql
-│       ├── merge_dim_family_scd2.sql
+│       ├── merge_dim_date.sql
 │       ├── merge_fact_relation.sql
 │       └── seed_reference_dimensions.sql
 ├── seed/
@@ -81,20 +86,21 @@ family-tree-warehouse/
 
 **Task graph:**
 ```
-init_schema (Python)
+init_schema (SQL)
     ↓
 extract_raw_data (Python)
     ↓
-seed_reference_dimensions (Python)
+seed_reference_dimensions (SQL)
     ↓
-merge_dim_person (Python) ──┐
-merge_dim_family (Python) ──┤
+merge_dim_person (SQL) ──┐
+merge_dim_date (SQL) ────┤
     ↓                    │
-merge_fact_relation (Python)
+merge_fact_relation (SQL)
 ```
 
 **Operators used:**
-- `PythonOperator`: Neo4j extraction + raw load + SQL file execution against DuckDB
+- `PythonOperator`: Neo4j extraction + raw load
+- `SQLExecuteQueryOperator`: executes SQL files through Airflow DuckDB connection (`duckdb_default`)
 
 ## Quick start
 
@@ -145,15 +151,17 @@ sudo docker exec family_tree_airflow airflow dags list-runs -d family_tree_dw_in
 
 **Query warehouse:**
 ```bash
-sudo docker exec family_tree_airflow python -c "
+sudo docker exec -u 0 family_tree_airflow python -c "
 import duckdb
-c = duckdb.connect('/opt/warehouse/family_tree.duckdb')
+c = duckdb.connect('/opt/warehouse/warehouse.duckdb')
 tables = ['raw_person_snapshot', 'raw_family_snapshot', 'raw_relation_snapshot', 
-          'dim_person', 'dim_family', 'fact_person_family_relation']
+      'dim_person', 'dim_relationship_role', 'dim_date', 'fact_person_relationship']
 for t in tables:
     print(f'{t}: {c.execute(f\"SELECT COUNT(*) FROM {t}\").fetchone()[0]} rows')
 "
 ```
+
+If you get `Permission denied` on DuckDB, keep `-u 0` in the `docker exec` command for ad-hoc reads.
 
 **View logs:**
 ```bash

@@ -1,36 +1,27 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
+from uuid import uuid4
 
-import duckdb
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 
 from py.extraction_utils import extract_and_load_raw_snapshot, get_settings
 
 
 def run_extraction_task() -> str:
     settings = get_settings()
-    run_id = extract_and_load_raw_snapshot(
+    run_id = str(uuid4())
+    extract_and_load_raw_snapshot(
         neo4j_uri=settings.neo4j_uri,
         neo4j_user=settings.neo4j_user,
         neo4j_password=settings.neo4j_password,
         duckdb_path=settings.duckdb_path,
+        run_id=run_id,
     )
     print(f"Raw extraction complete: {run_id}")
     return run_id
-
-
-def run_sql_file_task(sql_path: str) -> None:
-    settings = get_settings()
-    full_sql_path = Path("/opt/airflow/dags") / sql_path
-    sql = full_sql_path.read_text(encoding="utf-8")
-
-    conn = duckdb.connect(settings.duckdb_path)
-    conn.execute(sql)
-    conn.close()
-    print(f"Executed SQL file: {full_sql_path}")
 
 
 with DAG(
@@ -42,41 +33,47 @@ with DAG(
     template_searchpath=["/opt/airflow/dags"],
     tags=["etl"],
 ) as dag:
-    init_schema = PythonOperator(
+    init_schema = SQLExecuteQueryOperator(
         task_id="init_schema",
-        python_callable=run_sql_file_task,
-        op_kwargs={"sql_path": "sql/init_schema.sql"},
+        conn_id="duckdb_default",
+        sql="sql/init_schema.sql",
+        split_statements=True,
     )
 
     extract_raw_data = PythonOperator(
         task_id="extract_raw_data",
         python_callable=run_extraction_task,
+        do_xcom_push=True,
     )
 
-    seed_reference_dimensions = PythonOperator(
-        task_id="seed_reference_dimensions",
-        python_callable=run_sql_file_task,
-        op_kwargs={"sql_path": "sql/seed_reference_dimensions.sql"},
+    seed_reference_dimensions = SQLExecuteQueryOperator(
+        task_id="seed_dim_relationship_role",
+        conn_id="duckdb_default",
+        sql="sql/seed_dim_relationship_role.sql",
+        split_statements=True,
     )
 
-    merge_dim_person = PythonOperator(
+    merge_dim_person = SQLExecuteQueryOperator(
         task_id="merge_dim_person",
-        python_callable=run_sql_file_task,
-        op_kwargs={"sql_path": "sql/merge_dim_person_scd2.sql"},
+        conn_id="duckdb_default",
+        sql="sql/merge_dim_person.sql",
+        split_statements=True,
     )
 
-    merge_dim_family = PythonOperator(
-        task_id="merge_dim_family",
-        python_callable=run_sql_file_task,
-        op_kwargs={"sql_path": "sql/merge_dim_family_scd2.sql"},
+    merge_dim_date = SQLExecuteQueryOperator(
+        task_id="seed_dim_date",
+        conn_id="duckdb_default",
+        sql="sql/seed_dim_date.sql",
+        split_statements=True,
     )
 
-    merge_fact_relation = PythonOperator(
+    merge_fact_relation = SQLExecuteQueryOperator(
         task_id="merge_fact_relation",
-        python_callable=run_sql_file_task,
-        op_kwargs={"sql_path": "sql/merge_fact_relation.sql"},
+        conn_id="duckdb_default",
+        sql="sql/merge_fact_relation.sql",
+        split_statements=True,
     )
 
     init_schema >> extract_raw_data >> seed_reference_dimensions
-    seed_reference_dimensions >> [merge_dim_person, merge_dim_family]
-    [merge_dim_person, merge_dim_family] >> merge_fact_relation
+    seed_reference_dimensions >> [merge_dim_person, merge_dim_date]
+    [merge_dim_person, merge_dim_date] >> merge_fact_relation

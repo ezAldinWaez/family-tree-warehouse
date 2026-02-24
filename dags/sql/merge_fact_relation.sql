@@ -1,3 +1,29 @@
+-- Create sequence for fact relationship surrogate key if not exists
+CREATE SEQUENCE IF NOT EXISTS seq_fact_person_relationship_sk START 1;
+
+-- Create fact table for person relationships if not exists
+CREATE TABLE IF NOT EXISTS fact_person_relationship (
+  relationship_sk BIGINT PRIMARY KEY DEFAULT nextval('seq_fact_person_relationship_sk'),
+  source_person_sk BIGINT NOT NULL,
+  target_person_sk BIGINT NOT NULL,
+  relationship_role_sk BIGINT NOT NULL,
+  start_date_sk INTEGER,
+  end_date_sk INTEGER,
+  source_person_id VARCHAR NOT NULL,
+  target_person_id VARCHAR NOT NULL,
+  source_relationship_role_code VARCHAR NOT NULL,
+  start_date DATE,
+  end_date DATE,
+  end_reason VARCHAR,
+  first_seen_run_id VARCHAR NOT NULL,
+  last_seen_run_id VARCHAR NOT NULL,
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+  deleted_at_run_id VARCHAR,
+  relation_count INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 -- Get the latest ETL run ID
 CREATE TEMP TABLE tmp_current_run AS
 SELECT run_id
@@ -34,18 +60,17 @@ FROM raw_relation_snapshot r
 WHERE r.run_id = (SELECT run_id FROM tmp_current_run);
 
 -- Get spouse relationships with family dates
-CREATE TEMP TABLE tmp_family_spouse AS
+CREATE TEMP TABLE tmp_spouse_relation AS
 SELECT
-  lr.person_id,
-  lr.family_id,
-  lr.role,
-  lf.marriage_date,
-  lf.divorce_date,
-  lf.status
-FROM tmp_relation_latest lr
-JOIN tmp_family_latest lf
-  ON lf.family_id = lr.family_id
-WHERE lr.relationship_type = 'SPOUSE_OF';
+  rl.person_id,
+  rl.family_id,
+  rl.role,
+  fl.marriage_date,
+  fl.divorce_date,
+  fl.status
+FROM tmp_relation_latest rl
+JOIN tmp_family_latest fl ON fl.family_id = rl.family_id
+WHERE rl.relationship_type = 'SPOUSE_OF';
 
 -- Build spouse relationship edges
 CREATE TEMP TABLE tmp_spouse_edge AS
@@ -64,64 +89,58 @@ SELECT DISTINCT
     WHEN upper(coalesce(s1.status, '')) IN ('DIVORCED', 'ENDED') THEN 'STATUS_ENDED'
     ELSE NULL
   END AS end_reason
-FROM tmp_family_spouse s1
-JOIN tmp_family_spouse s2
-  ON s1.family_id = s2.family_id
- AND s1.person_id <> s2.person_id;
+FROM tmp_spouse_relation s1
+JOIN tmp_spouse_relation s2 ON s1.family_id = s2.family_id AND s1.person_id <> s2.person_id;
 
 -- Extract parent IDs from family
-CREATE TEMP TABLE tmp_family_parent AS
+CREATE TEMP TABLE tmp_parent_relation AS
 SELECT
   person_id AS parent_id,
   family_id,
   marriage_date
-FROM tmp_family_spouse;
+FROM tmp_spouse_relation;
 
 -- Extract child relationships with birth dates
-CREATE TEMP TABLE tmp_family_child AS
+CREATE TEMP TABLE tmp_child_relation AS
 SELECT
-  lr.person_id AS child_id,
-  lr.family_id,
-  lp.birth_date AS child_birth_date
-FROM tmp_relation_latest lr
-LEFT JOIN tmp_person_latest lp
-  ON lp.person_id = lr.person_id
-WHERE lr.relationship_type = 'CHILD_OF';
+  rl.person_id AS child_id,
+  rl.family_id,
+  pl.birth_date AS child_birth_date
+FROM tmp_relation_latest rl
+LEFT JOIN tmp_person_latest pl ON pl.person_id = rl.person_id
+WHERE rl.relationship_type = 'CHILD_OF';
 
 -- Build parent-child relationship edges in both directions
 CREATE TEMP TABLE tmp_parent_child_edge AS
 SELECT DISTINCT
-  fp.parent_id AS source_person_id,
-  fc.child_id AS target_person_id,
+  pr.parent_id AS source_person_id,
+  cr.child_id AS target_person_id,
   'PARENT' AS relationship_role_code,
-  coalesce(fp.marriage_date, fc.child_birth_date) AS start_date,
+  coalesce(pr.marriage_date, cr.child_birth_date) AS start_date,
   CAST(NULL AS DATE) AS end_date,
   CAST(NULL AS VARCHAR) AS end_reason
-FROM tmp_family_parent fp
-JOIN tmp_family_child fc
-  ON fp.family_id = fc.family_id
+FROM tmp_parent_relation pr
+JOIN tmp_child_relation cr ON pr.family_id = cr.family_id
 
 UNION ALL
 
 SELECT DISTINCT
-  fc.child_id AS source_person_id,
-  fp.parent_id AS target_person_id,
+  cr.child_id AS source_person_id,
+  pr.parent_id AS target_person_id,
   'CHILD' AS relationship_role_code,
-  fc.child_birth_date AS start_date,
+  cr.child_birth_date AS start_date,
   CAST(NULL AS DATE) AS end_date,
   CAST(NULL AS VARCHAR) AS end_reason
-FROM tmp_family_parent fp
-JOIN tmp_family_child fc
-  ON fp.family_id = fc.family_id;
+FROM tmp_parent_relation pr
+JOIN tmp_child_relation cr ON pr.family_id = cr.family_id;
 
 -- Map parent-child relationships for sibling detection
 CREATE TEMP TABLE tmp_parent_child_map AS
 SELECT DISTINCT
-  fp.parent_id,
-  fc.child_id
-FROM tmp_family_parent fp
-JOIN tmp_family_child fc
-  ON fp.family_id = fc.family_id;
+  pr.parent_id,
+  cr.child_id
+FROM tmp_parent_relation pr
+JOIN tmp_child_relation cr ON pr.family_id = cr.family_id;
 
 -- Identify sibling pairs and count shared parents
 CREATE TEMP TABLE tmp_sibling_pair AS
@@ -130,9 +149,7 @@ SELECT
   pcm2.child_id AS person_b,
   count(DISTINCT pcm1.parent_id) AS shared_parent_count
 FROM tmp_parent_child_map pcm1
-JOIN tmp_parent_child_map pcm2
-  ON pcm1.parent_id = pcm2.parent_id
- AND pcm1.child_id < pcm2.child_id
+JOIN tmp_parent_child_map pcm2 ON pcm1.parent_id = pcm2.parent_id AND pcm1.child_id < pcm2.child_id
 GROUP BY pcm1.child_id, pcm2.child_id;
 
 -- Build sibling relationship edges in both directions
@@ -148,10 +165,8 @@ SELECT
   CAST(NULL AS DATE) AS end_date,
   CAST(NULL AS VARCHAR) AS end_reason
 FROM tmp_sibling_pair sp
-LEFT JOIN tmp_person_latest pa
-  ON pa.person_id = sp.person_a
-LEFT JOIN tmp_person_latest pb
-  ON pb.person_id = sp.person_b
+LEFT JOIN tmp_person_latest pa ON pa.person_id = sp.person_a
+LEFT JOIN tmp_person_latest pb ON pb.person_id = sp.person_b
 
 UNION ALL
 
@@ -166,10 +181,8 @@ SELECT
   CAST(NULL AS DATE) AS end_date,
   CAST(NULL AS VARCHAR) AS end_reason
 FROM tmp_sibling_pair sp
-LEFT JOIN tmp_person_latest pa
-  ON pa.person_id = sp.person_a
-LEFT JOIN tmp_person_latest pb
-  ON pb.person_id = sp.person_b;
+LEFT JOIN tmp_person_latest pa ON pa.person_id = sp.person_a
+LEFT JOIN tmp_person_latest pb ON pb.person_id = sp.person_b;
 
 -- Combine all relationship types
 CREATE TEMP TABLE tmp_combined_edge AS
@@ -308,10 +321,10 @@ DROP TABLE tmp_sibling_edge;
 DROP TABLE tmp_sibling_pair;
 DROP TABLE tmp_parent_child_map;
 DROP TABLE tmp_parent_child_edge;
-DROP TABLE tmp_family_child;
-DROP TABLE tmp_family_parent;
+DROP TABLE tmp_child_relation;
+DROP TABLE tmp_parent_relation;
 DROP TABLE tmp_spouse_edge;
-DROP TABLE tmp_family_spouse;
+DROP TABLE tmp_spouse_relation;
 DROP TABLE tmp_relation_latest;
 DROP TABLE tmp_family_latest;
 DROP TABLE tmp_person_latest;

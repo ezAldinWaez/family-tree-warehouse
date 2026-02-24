@@ -153,7 +153,7 @@ sudo docker exec family_tree_airflow airflow dags list-runs -d family_tree_dw_in
 ```bash
 sudo docker exec -u 0 family_tree_airflow python -c "
 import duckdb
-c = duckdb.connect('/opt/warehouse/warehouse.duckdb')
+c = duckdb.connect('/opt/data/warehouse/warehouse.duckdb')
 tables = ['raw_person_snapshot', 'raw_family_snapshot', 'raw_relation_snapshot', 
       'dim_person', 'dim_relationship_role', 'dim_date', 'fact_person_relationship']
 for t in tables:

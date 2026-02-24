@@ -1,3 +1,25 @@
+-- Create sequence for person surrogate key if not exists
+CREATE SEQUENCE IF NOT EXISTS seq_person_sk START 1;
+
+-- Create person dimension table with SCD Type 2 tracking if not exists
+CREATE TABLE IF NOT EXISTS dim_person (
+  person_sk BIGINT PRIMARY KEY DEFAULT nextval('seq_person_sk'),
+  person_id VARCHAR NOT NULL,
+  first_name VARCHAR,
+  last_name VARCHAR,
+  sex VARCHAR,
+  birth_date DATE,
+  death_date DATE,
+  education VARCHAR,
+  works VARCHAR,
+  attr_hash VARCHAR,
+  valid_from_run_id VARCHAR NOT NULL,
+  valid_to_run_id VARCHAR,
+  is_current BOOLEAN NOT NULL DEFAULT TRUE,
+  is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 -- Get the latest ETL run ID
 CREATE TEMP TABLE tmp_current_run AS
 SELECT run_id

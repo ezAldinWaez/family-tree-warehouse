@@ -19,6 +19,6 @@ fi
 
 airflow connections add duckdb_default \
   --conn-type duckdb \
-  --conn-host "/opt/warehouse/warehouse.duckdb"
+  --conn-host "/opt/data/warehouse/warehouse.duckdb"
 
 exec airflow standalone

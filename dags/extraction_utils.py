@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -19,16 +18,6 @@ class Settings:
     neo4j_user: str
     neo4j_password: str
     duckdb_path: str
-
-
-def get_settings(dotenv_path: str | None = None) -> Settings:
-    load_dotenv(dotenv_path)
-    return Settings(
-        neo4j_uri=os.environ.get("NEO4J_URI"),
-        neo4j_user=os.environ.get("NEO4J_USER"),
-        neo4j_password=os.environ.get("NEO4J_PASSWORD"),
-        duckdb_path="/opt/warehouse/warehouse.duckdb",
-    )
 
 
 def connect_duckdb(db_path: str) -> duckdb.DuckDBPyConnection:
@@ -150,8 +139,9 @@ def extract_and_load_raw_snapshot(
     duckdb_path: str,
     run_id: str,
 ) -> None:
+    started_at = datetime.now(timezone.utc)
+
     people, families, relations = extract_all(neo4j_uri, neo4j_user, neo4j_password)
-    extracted_at = datetime.now(timezone.utc)
 
     conn = connect_duckdb(duckdb_path)
 
@@ -213,7 +203,7 @@ def extract_and_load_raw_snapshot(
         INSERT INTO etl_run_log(run_id, started_at)
         VALUES (?, ?)
         """,
-        [run_id, extracted_at],
+        [run_id, started_at],
     )
 
     conn.close()

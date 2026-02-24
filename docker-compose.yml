@@ -40,10 +40,11 @@ services:
       - "8080:8080"
     volumes:
       - ./dags:/opt/airflow/dags
-      - ./warehouse:/opt/warehouse
+      - airflow_data:/opt/data
       - airflow_logs:/opt/airflow/logs
 
 volumes:
   neo4j_data:
   neo4j_logs:
+  airflow_data:
   airflow_logs:

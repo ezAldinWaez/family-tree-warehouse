@@ -1,3 +1,17 @@
+-- Create date dimension table if not exists
+CREATE TABLE IF NOT EXISTS dim_date (
+  date_sk INTEGER PRIMARY KEY,
+  full_date DATE UNIQUE NOT NULL,
+  day_of_month TINYINT NOT NULL,
+  month_of_year TINYINT NOT NULL,
+  month_name VARCHAR NOT NULL,
+  quarter_of_year TINYINT NOT NULL,
+  year_num SMALLINT NOT NULL,
+  day_of_week TINYINT NOT NULL,
+  day_name VARCHAR NOT NULL,
+  is_weekend BOOLEAN NOT NULL
+);
+
 -- Populate date dimension with dates from 1900 to 2100
 WITH date_series AS (
   SELECT CAST(full_date AS DATE) AS full_date

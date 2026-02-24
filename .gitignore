@@ -6,7 +6,6 @@ __pycache__/
 
 .env
 
-warehouse/
 *.duckdb
 
 .DS_Store

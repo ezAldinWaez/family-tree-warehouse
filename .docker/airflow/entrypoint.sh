@@ -18,6 +18,7 @@ if airflow connections get duckdb_default >/dev/null 2>&1; then
 fi
 
 airflow connections add duckdb_default \
-  --conn-uri "duckdb:////opt/warehouse/family_tree.duckdb"
+  --conn-type duckdb \
+  --conn-host "/opt/warehouse/warehouse.duckdb"
 
 exec airflow standalone

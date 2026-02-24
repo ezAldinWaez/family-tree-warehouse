@@ -4,19 +4,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import duckdb
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
-
-
-# ============================================================================
-# Configuration
-# ============================================================================
 
 
 @dataclass(frozen=True)
@@ -29,32 +23,17 @@ class Settings:
 
 def get_settings(dotenv_path: str | None = None) -> Settings:
     load_dotenv(dotenv_path)
-    duckdb_path = "/opt/warehouse/family_tree.duckdb"
     return Settings(
         neo4j_uri=os.environ.get("NEO4J_URI"),
         neo4j_user=os.environ.get("NEO4J_USER"),
         neo4j_password=os.environ.get("NEO4J_PASSWORD"),
-        duckdb_path=duckdb_path,
+        duckdb_path="/opt/warehouse/warehouse.duckdb",
     )
 
 
-# ============================================================================
-# DuckDB helpers
-# ============================================================================
-
-
-def ensure_parent_dir(db_path: str) -> None:
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-
-
 def connect_duckdb(db_path: str) -> duckdb.DuckDBPyConnection:
-    ensure_parent_dir(db_path)
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     return duckdb.connect(database=db_path)
-
-
-# ============================================================================
-# Neo4j extraction
-# ============================================================================
 
 
 @dataclass(frozen=True)
@@ -87,33 +66,21 @@ class RelationRow:
 
 PERSON_QUERY = """
 MATCH (p:Person)
-RETURN
-  p.id AS person_id,
-  p.first_name AS first_name,
-  p.last_name AS last_name,
-  p.sex AS sex,
-  p.birth_date AS birth_date,
-  p.death_date AS death_date,
-  p.education AS education,
-  p.works AS works
+RETURN p { .* } AS person_data
 """
 
 FAMILY_QUERY = """
 MATCH (f:Family)
-RETURN
-  f.id AS family_id,
-  f.marriage_date AS marriage_date,
-  f.divorce_date AS divorce_date,
-  f.status AS status
+RETURN f { .* } AS family_data
 """
 
 RELATION_QUERY = """
-MATCH (p:Person)-[r:SPOUSE_OF|CHILD_OF]->(f:Family)
+MATCH (p:Person)-[r]->(f:Family)
 RETURN
   p.id AS person_id,
   f.id AS family_id,
   type(r) AS relationship_type,
-  coalesce(r.role, 'NONE') AS role
+  r {.*} AS relationship_data
 """
 
 
@@ -129,34 +96,38 @@ def _normalize_date(value: Any) -> date | None:
     raise TypeError(f"Unsupported date value type: {type(value)}")
 
 
-def _as_person(row: dict) -> PersonRow:
+def _as_person(record: dict) -> PersonRow:
+    assert "person_data" in record and isinstance(record["person_data"], dict)
     return PersonRow(
-        person_id=row["person_id"],
-        first_name=row["first_name"],
-        last_name=row["last_name"],
-        sex=row["sex"],
-        birth_date=_normalize_date(row["birth_date"]),
-        death_date=_normalize_date(row["death_date"]),
-        education=row["education"],
-        works=row["works"],
+        person_id=record["person_data"].get("id"),
+        first_name=record["person_data"].get("first_name"),
+        last_name=record["person_data"].get("last_name"),
+        sex=record["person_data"].get("sex"),
+        birth_date=_normalize_date(record["person_data"].get("birth_date")),
+        death_date=_normalize_date(record["person_data"].get("death_date")),
+        education=record["person_data"].get("education"),
+        works=record["person_data"].get("works"),
     )
 
 
-def _as_family(row: dict) -> FamilyRow:
+def _as_family(record: dict) -> FamilyRow:
+    assert "family_data" in record and isinstance(record["family_data"], dict)
     return FamilyRow(
-        family_id=row["family_id"],
-        marriage_date=_normalize_date(row["marriage_date"]),
-        divorce_date=_normalize_date(row["divorce_date"]),
-        status=row["status"],
+        family_id=record["family_data"].get("id"),
+        marriage_date=_normalize_date(record["family_data"].get("marriage_date")),
+        divorce_date=_normalize_date(record["family_data"].get("divorce_date")),
+        status=record["family_data"].get("status"),
     )
 
 
-def _as_relation(row: dict) -> RelationRow:
+def _as_relation(record: dict) -> RelationRow:
+    assert ("person_id" in record and "family_id" in record and "relationship_type" in record
+            and "relationship_data" in record and isinstance(record["relationship_data"], dict))
     return RelationRow(
-        person_id=row["person_id"],
-        family_id=row["family_id"],
-        relationship_type=row["relationship_type"],
-        role=row["role"],
+        person_id=record["person_id"],
+        family_id=record["family_id"],
+        relationship_type=record["relationship_type"],
+        role=record["relationship_data"].get("role"),
     )
 
 
@@ -167,16 +138,9 @@ def extract_all(
     with driver.session() as session:
         people = [_as_person(record.data()) for record in session.run(PERSON_QUERY)]
         families = [_as_family(record.data()) for record in session.run(FAMILY_QUERY)]
-        relations = [
-            _as_relation(record.data()) for record in session.run(RELATION_QUERY)
-        ]
+        relations = [_as_relation(record.data()) for record in session.run(RELATION_QUERY)]
     driver.close()
     return people, families, relations
-
-
-# ============================================================================
-# Extraction + Load (for Airflow task)
-# ============================================================================
 
 
 def extract_and_load_raw_snapshot(
@@ -184,11 +148,10 @@ def extract_and_load_raw_snapshot(
     neo4j_user: str,
     neo4j_password: str,
     duckdb_path: str,
-    run_id: str | None = None,
-) -> str:
+    run_id: str,
+) -> None:
     people, families, relations = extract_all(neo4j_uri, neo4j_user, neo4j_password)
-    resolved_run_id = run_id or str(uuid4())
-    extracted_at = datetime.utcnow()
+    extracted_at = datetime.now(timezone.utc)
 
     conn = connect_duckdb(duckdb_path)
 
@@ -196,13 +159,12 @@ def extract_and_load_raw_snapshot(
         conn.execute(
             """
             INSERT INTO raw_person_snapshot (
-              run_id, extracted_at, person_id, first_name, last_name, sex,
+              run_id, person_id, first_name, last_name, sex,
               birth_date, death_date, education, works
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                resolved_run_id,
-                extracted_at,
+                run_id,
                 person.person_id,
                 person.first_name,
                 person.last_name,
@@ -218,12 +180,11 @@ def extract_and_load_raw_snapshot(
         conn.execute(
             """
             INSERT INTO raw_family_snapshot (
-              run_id, extracted_at, family_id, marriage_date, divorce_date, status
-            ) VALUES (?, ?, ?, ?, ?, ?)
+              run_id, family_id, marriage_date, divorce_date, status
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             [
-                resolved_run_id,
-                extracted_at,
+                run_id,
                 family.family_id,
                 family.marriage_date,
                 family.divorce_date,
@@ -235,12 +196,11 @@ def extract_and_load_raw_snapshot(
         conn.execute(
             """
             INSERT INTO raw_relation_snapshot (
-              run_id, extracted_at, person_id, family_id, relationship_type, role
-            ) VALUES (?, ?, ?, ?, ?, ?)
+              run_id, person_id, family_id, relationship_type, role
+            ) VALUES (?, ?, ?, ?, ?)
             """,
             [
-                resolved_run_id,
-                extracted_at,
+                run_id,
                 relation.person_id,
                 relation.family_id,
                 relation.relationship_type,
@@ -250,10 +210,10 @@ def extract_and_load_raw_snapshot(
 
     conn.execute(
         """
-        INSERT INTO etl_run_log(run_id, started_at, status, dq_passed)
-        VALUES (?, ?, 'RUNNING', FALSE)
+        INSERT INTO etl_run_log(run_id, started_at)
+        VALUES (?, ?)
         """,
-        [resolved_run_id, extracted_at],
+        [run_id, extracted_at],
     )
+
     conn.close()
-    return resolved_run_id

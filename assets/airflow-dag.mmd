@@ -1,0 +1,11 @@
+flowchart TD
+    A["init_raw_tables<br/>_SQLExecuteQueryOperator_"]
+    B["extract_raw_data<br/>_PythonOperator_"]
+    C["seed_dim_relationship_role<br/>_SQLExecuteQueryOperator_"]
+    D["seed_dim_date<br/>_SQLExecuteQueryOperator_"]
+    E["merge_dim_person<br/>_SQLExecuteQueryOperator_"]
+    F["merge_fact_relation<br/>_SQLExecuteQueryOperator_"]
+
+    A --> B
+    B --> C & D & E
+    C & D & E --> F

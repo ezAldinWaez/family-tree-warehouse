@@ -1,173 +1,140 @@
-# Family Tree Warehouse
+---
+title: Family Tree Warehouse
+subtitle: An Incremental ETL Pipeline from Neo4j Graph to DuckDB Dimensional Warehouse for Family Relationship Analytics
+author: "Ez Aldin Waez"
+date: "2026-03-03"
+lang: en
+abstract: |
+    This project presents the design and implementation of an incremental ETL pipeline that transforms genealogical data stored in a Neo4j graph database into a dimensional data warehouse backed by DuckDB. The pipeline is orchestrated by Apache Airflow and follows a snapshot-diff strategy that eliminates the need for CDC instrumentation in the source system. The resulting star schema features an SCD2 person dimension, a semantic relationship-role dimension, a conformed calendar dimension, and a directed-relationship fact table. A demo dataset of 36 persons across six generations and twelve family units, along with three incremental change scenarios, validates the end-to-end pipeline behavior.
+toc: true
+toc-depth: 1
+numbersections: true
+documentclass: article
+papersize: a4
+fontsize: 12pt
+geometry: "margin=2.5cm"
+colorlinks: true
+linkcolor: NavyBlue
+urlcolor: NavyBlue
+---
 
-Airflow-based incremental ETL pipeline: Neo4j -> DuckDB star schema for family graph analytics.
+# Introduction
 
-## What this does
+Genealogical data is inherently graph-structured, making Neo4j a natural source of truth. However, analytical workloads — aggregate counts, temporal metrics, historical change tracking — are better served by dimensional models and relational engines.
 
-Extracts family tree data from Neo4j and builds a dimensional warehouse in DuckDB with:
-- **SCD2 dimension** for `person` tracking historical changes
-- **Semantic relationship-role dimension** (type + directed role + inverse/symmetry rules)
-- **Calendar date dimension** for reusable time analysis
-- **Factless fact table** capturing directed person-person relationships over time
-- **Incremental snapshot-diff** strategy (no CDC required)
+This project bridges that gap: a Neo4j graph feeds a DuckDB star schema through a daily incremental Airflow pipeline. Changes are detected via attribute hashing (no CDC required), person history is tracked via SCD2, and implicit relationships (siblings, parent–child) are derived from family membership.
 
-## Architecture
+# System Architecture
 
-**Pipeline:** Neo4j (graph source) -> Python extraction -> DuckDB raw snapshots -> SQL transforms -> Star schema
+## High-Level Overview
 
-```mermaid
-flowchart TD
-  A["Neo4j Graph<br>Person, Family, SPOUSE_OF, CHILD_OF"] 
-  B["Airflow: extract_raw_data<br>(PythonOperator)"]
-  C["DuckDB Raw Snapshots<br>raw_person_snapshot<br>raw_family_snapshot<br>raw_relation_snapshot"]
-    D["Dimension Loads<br>(SQLExecuteQueryOperator)"]
-    E["Fact Merge<br>(SQLExecuteQueryOperator)"]
-  F["Star Schema<br>dim_person, dim_relationship_role, dim_date<br>fact_person_relationship"]
-    G["Run Status Update"]
-  A --> B --> C --> D --> E --> F --> G
-```
+Neo4j acts as the operational source of truth, storing persons and families as graph nodes with typed relationship edges. Apache Airflow runs a daily DAG that extracts a full snapshot from Neo4j via the Python driver, loads it into DuckDB staging tables tagged with a `run_id`, and then executes a series of SQL merge scripts to update the dimensional model. DuckDB serves as the analytical warehouse — all staging, dimension, and fact tables live in a single `.duckdb` file. Docker Compose brings up Neo4j and Airflow as isolated containers sharing a mounted data volume where the warehouse file resides.
 
-## Star schema
+## Technology Stack
 
-**Dimensions:**
-- `dim_person` (SCD2): tracks person attributes with versioning (`is_current`, `valid_from_run_id`, `valid_to_run_id`, `is_deleted`)
-- `dim_relationship_role`: unified semantic dimension for relationship type + directed role (`relationship_role_code`, inverse role mapping, symmetry)
-- `dim_date`: standard calendar dimension (`date_sk`, `full_date`, day/month/quarter/year attributes)
+| Layer                  | Technology                                   |
+| ---------------------- | -------------------------------------------- |
+| Source database        | Neo4j                                        |
+| Warehouse database     | DuckDB                                       |
+| Orchestration          | Apache Airflow                               |
+| Airflow–DuckDB adapter | airflow-provider-duckdb                      |
+| Neo4j Python driver    | neo4j                                        |
+| Containerization       | Docker / Docker Compose                      |
+| Scripting              | Python 3, SQL (DuckDB dialect), Cypher, Bash |
+: Technology Stack
 
-**Fact:**
-- `fact_person_relationship`: grain = one row per directed relationship `(source_person_id, target_person_id, relationship_role_code, start_date, end_date, end_reason)`
-- Tracks relationship lifecycle (`start_date`, nullable `end_date`, nullable `end_reason`) plus first/last seen run and soft deletes
+# Data Model
 
-**Derived relationships:**
-- Spouse edges are generated in both directions from family spouse memberships
-- Parent/child edges are generated in both directions
-- Sibling logic uses shared parents: `SIBLING` for 2+ shared parents, `HALF_SIBLING` for exactly 1 shared parent
-
-## Incremental strategy
-
-**Snapshot-diff approach** (no CDC fields required in Neo4j):
-
-1. Extract full source state into raw snapshot tables tagged with `run_id`
-2. Compare snapshots using attribute hashes to detect SCD2 changes
-3. Upsert dimension rows and expire outdated versions
-4. Merge fact table and soft-delete missing relationships
-
-This ensures reliable incremental loads without requiring `updated_at` columns in the source.
-
-## Repository structure
+## Source Schema (Neo4j)
 
 ```
-family-tree-warehouse/
-├── dags/
-│   ├── family_tree_dw_dag.py
-│   └── py/
-│   │   └── extraction_utils.py
-│   └── sql/
-│       ├── init_schema.sql
-│       ├── merge_dim_person_scd2.sql
-│       ├── merge_dim_date.sql
-│       ├── merge_fact_relation.sql
-│       └── seed_reference_dimensions.sql
-├── seed/
-│   └── init_cruz_young_family_tree.cyp  # Sample Neo4j seed data
-├── .docker/
-│   └── airflow/
-│       ├── Dockerfile
-│       ├── entrypoint.sh
-│       └── requirements.txt
-├── .env.example                   # Environment template
-├── docker-compose.yml             # Local Neo4j + Airflow stack
-└── README.md
+Node: Person     -- id, first_name, last_name, sex, birth_date,
+                    death_date, education, works
+Node: Family     -- id, marriage_date, divorce_date,
+                    status (ACTIVE | WIDOWED | DIVORCED)
+
+(Person)-[:SPOUSE_OF { role: HUSBAND | WIFE | PARTNER }]->(Family)
+(Person)-[:CHILD_OF]->(Family)
 ```
 
-## Airflow DAG structure
+## Staging Layer (DuckDB)
 
-**DAG:** `family_tree_dw_incremental` (daily schedule)
+Raw snapshot tables capture the full source state per ETL run, keyed by `run_id`:
+`etl_run_log`, `raw_person_snapshot`, `raw_family_snapshot`, `raw_relation_snapshot`.
 
-**Task graph:**
-```
-init_schema (SQL)
-    ↓
-extract_raw_data (Python)
-    ↓
-seed_reference_dimensions (SQL)
-    ↓
-merge_dim_person (SQL) ──┐
-merge_dim_date (SQL) ────┤
-    ↓                    │
-merge_fact_relation (SQL)
-```
+## Dimensional Model (Star Schema)
 
-**Operators used:**
-- `PythonOperator`: Neo4j extraction + raw load
-- `SQLExecuteQueryOperator`: executes SQL files through Airflow DuckDB connection (`duckdb_default`)
+**`dim_person` (SCD2)** — tracks full attribute history via `attr_hash` (MD5), `valid_from_run_id`, `valid_to_run_id`, `is_current`, and `is_deleted`.
 
-## Quick start
+**`dim_relationship_role`** — seven role codes covering all derived edge types:
 
-**Step 0: Create local environment file**
-```bash
-cp .env.example .env
-```
+| Role Code        | Type         | Symmetric |
+| ---------------- | ------------ | --------- |
+| `SPOUSE_HUSBAND` | SPOUSE       | false     |
+| `SPOUSE_WIFE`    | SPOUSE       | false     |
+| `SPOUSE_PARTNER` | SPOUSE       | true      |
+| `PARENT`         | PARENT_CHILD | false     |
+| `CHILD`          | PARENT_CHILD | false     |
+| `SIBLING`        | SIBLING      | true      |
+| `HALF_SIBLING`   | SIBLING      | true      |
+: Relationship Role Codes
 
-**Optional (Linux): run Docker without `sudo`**
-```bash
-sudo usermod -aG docker $USER
-newgrp docker
-```
+**`dim_date`** — conformed calendar from 1900-01-01 to 2099-12-31; `date_sk` formatted as `YYYYMMDD`.
 
-**Step 1: Start the stack**
-```bash
-sudo docker compose up -d --build
-```
+**`fact_person_relationship`** — grain: one directed relationship per `(source_person, target_person, role, start_date)`. Carries FKs to all dimensions, `end_reason`, run-ID range tracking, and soft-delete flags.
 
-**Step 2: Wait for services** (~30-60 seconds for Airflow to initialize)
+Edges are derived from Family membership: spouse pairs, parent–child pairs, full siblings (same two parents), and half-siblings (one shared parent).
 
-**Step 3: Seed demo Neo4j data**
-```bash
-# Reset graph (optional, for clean demo runs)
-sudo docker exec family_tree_neo4j cypher-shell -u neo4j -p password "MATCH (n) DETACH DELETE n"
+# ETL Pipeline
 
-# Load sample family tree
-sudo docker exec -i family_tree_neo4j cypher-shell -u neo4j -p password < seed/init_cruz_young_family_tree.cyp
-```
+## Airflow DAG
 
-**Step 4: Trigger the DAG**
-```bash
-# Unpause and trigger the ETL pipeline
-sudo docker exec family_tree_airflow airflow dags unpause family_tree_dw_incremental
-sudo docker exec family_tree_airflow airflow dags trigger family_tree_dw_incremental
-```
+**DAG ID:** `family_tree_dw_incremental` | **Schedule:** Daily | **Executor:** Sequential
 
-**Step 5: Monitor**
-- **Airflow UI:** http://localhost:8080 
-- **Neo4j Browser:** http://localhost:7474
+![ETL Airflow DAG](assets/airflow-dag.png)
 
-## Validation
+## Incremental Strategy (Snapshot-Diff)
 
-**Check DAG runs:**
-```bash
-sudo docker exec family_tree_airflow airflow dags list-runs -d family_tree_dw_incremental
-```
+1. **Extract** — pull all nodes and edges from Neo4j; write into raw snapshot tables with current `run_id`.
+2. **Detect changes** — compute `MD5` over tracked `dim_person` attributes; compare against stored `attr_hash`.
+3. **SCD2 update** — expire changed rows (`valid_to_run_id`, `is_current = false`); insert new versions.
+4. **Soft-delete** — flag persons and relationships absent from the current snapshot.
+5. **Merge fact table** — re-derive all edges; upsert new or changed rows; soft-delete removed edges.
 
-**Query warehouse:**
-```bash
-sudo docker exec -u 0 family_tree_airflow python -c "
-import duckdb
-c = duckdb.connect('/opt/data/warehouse/warehouse.duckdb')
-tables = ['raw_person_snapshot', 'raw_family_snapshot', 'raw_relation_snapshot', 
-      'dim_person', 'dim_relationship_role', 'dim_date', 'fact_person_relationship']
-for t in tables:
-    print(f'{t}: {c.execute(f\"SELECT COUNT(*) FROM {t}\").fetchone()[0]} rows')
-"
-```
+Re-running the same snapshot produces no changes (idempotent by design).
 
-If you get `Permission denied` on DuckDB, keep `-u 0` in the `docker exec` command for ad-hoc reads.
+# Demo Dataset
 
-**View logs:**
-```bash
-# Airflow task logs
-sudo docker logs family_tree_airflow
+The Cruz-Young family tree: 36 persons across 6 generations in 12 family units. Three incremental scenarios validate change-handling:
 
-# All services
-sudo docker compose logs -f
-```
+| #   | Change Type                  | What It Tests                                           |
+| --- | ---------------------------- | ------------------------------------------------------- |
+| 01  | New births + new marriage    | New SCD2 rows; new fact edges                           |
+| 02  | Life event attribute updates | MD5 change detection; SCD2 expiry and version insert    |
+| 03  | Relationship correction      | Soft-delete of incorrect edge; insert of corrected edge |
+: Incremental Change Scenarios Applied to the Cruz-Young Demo Dataset
+
+# Analytical Reports
+
+| #   | Title                    | Description                                                     |
+| --- | ------------------------ | --------------------------------------------------------------- |
+| 01  | Person Relationship Card | All current relationships per person with roles and dates       |
+| 02  | Marriage Timeline        | Marriage start/end dates, durations, and end reasons            |
+| 03  | Ancestor Lineage Trace   | Recursive CTE tracing full ancestry chain with generation depth |
+: Analytical SQL Reports
+
+# Design Decisions
+
+| Decision                        | Rationale                                                                                                |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| **Snapshot-diff over CDC**      | Avoids instrumenting Neo4j with `updated_at` fields; full snapshots are acceptable at genealogical scale |
+| **MD5 attribute hashing**       | Compact, deterministic change detection across multiple columns                                          |
+| **Directed fact table grain**   | Enables role-specific filtering without self-joins; bidirectional edges keep queries symmetric           |
+| **DuckDB as warehouse**         | Zero-server, single-file, full SQL — sufficient for sub-million-row genealogical data                    |
+| **Sequential Airflow executor** | Appropriate for workload size; can be swapped for LocalExecutor or CeleryExecutor if needed              |
+| **Soft deletes throughout**     | Preserves historical data; enables detection of corrections and reversions                               |
+: Key design decisions and their rationale.
+
+# Conclusion
+
+This project demonstrates how graph-native genealogical data can be incrementally transformed into a dimensional warehouse without source-system instrumentation. The snapshot-diff strategy with MD5 change detection and SCD2 versioning produces a robust, replayable pipeline. The resulting star schema enables relationship history, temporal metrics, and recursive ancestry queries that would be cumbersome to express directly against Neo4j.
